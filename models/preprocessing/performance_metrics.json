@@ -1,0 +1,73 @@
+{
+  "total_time": 34.6268949508667,
+  "cpu_cores": 15,
+  "final_memory_gb": 0.8161888122558594,
+  "step_metrics": [
+    {
+      "step": "Data loading",
+      "memory_gb": 0.5810813903808594,
+      "cpu_percent": 8.2,
+      "time_sec": 0.23356270790100098
+    },
+    {
+      "step": "Time series alignment",
+      "memory_gb": 0.5915794372558594,
+      "cpu_percent": 14.1,
+      "time_sec": 0.21958589553833008
+    },
+    {
+      "step": "Missing value imputation",
+      "memory_gb": 0.6085433959960938,
+      "cpu_percent": 43.4,
+      "time_sec": 1.4817214012145996
+    },
+    {
+      "step": "Lagged features creation",
+      "memory_gb": 0.6627311706542969,
+      "cpu_percent": 11.3,
+      "time_sec": 1.6382229328155518
+    },
+    {
+      "step": "Rolling statistics creation",
+      "memory_gb": 0.681884765625,
+      "cpu_percent": 9.8,
+      "time_sec": 6.940663576126099
+    },
+    {
+      "step": "Temperature differential features",
+      "memory_gb": 0.6778526306152344,
+      "cpu_percent": 8.5,
+      "time_sec": 0.4866042137145996
+    },
+    {
+      "step": "Temperature anomaly detection",
+      "memory_gb": 0.7962303161621094,
+      "cpu_percent": 9.4,
+      "time_sec": 22.469345569610596
+    },
+    {
+      "step": "Material ratio features",
+      "memory_gb": 0.7969131469726562,
+      "cpu_percent": 10.4,
+      "time_sec": 0.32451486587524414
+    },
+    {
+      "step": "Accretion indicator features",
+      "memory_gb": 0.7971725463867188,
+      "cpu_percent": 9.7,
+      "time_sec": 0.2295236587524414
+    },
+    {
+      "step": "Target variables creation",
+      "memory_gb": 0.9586639404296875,
+      "cpu_percent": 23.5,
+      "time_sec": 0.3466036319732666
+    },
+    {
+      "step": "Dimension reduction",
+      "memory_gb": 0.8095169067382812,
+      "cpu_percent": 9.7,
+      "time_sec": 0.16354703903198242
+    }
+  ]
+}

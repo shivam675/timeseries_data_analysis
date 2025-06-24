@@ -1,0 +1,323 @@
+import os
+import numpy as np
+import pandas as pd
+import joblib
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, mean_squared_error, r2_score
+
+# PyTorch imports
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import Dataset, DataLoader
+    TORCH_AVAILABLE = True
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+except ImportError:
+    TORCH_AVAILABLE = False
+    DEVICE = 'cpu'
+    print("PyTorch not available. LSTM/Transformer models will not be functional.")
+
+class TimeSeriesDataset(Dataset):
+    def __init__(self, X, y=None, seq_len=10):
+        self.X = X
+        self.y = y
+        self.seq_len = seq_len
+        self.n_samples, self.n_features = X.shape
+    def __len__(self):
+        return self.n_samples
+    def __getitem__(self, idx):
+        # Handle sequence padding for early samples
+        if idx < self.seq_len:
+            pad = np.zeros((self.seq_len-idx, self.n_features))
+            x_seq = np.vstack([pad, self.X[max(0, idx-self.seq_len+1):idx+1]])
+        else:
+            x_seq = self.X[idx-self.seq_len+1:idx+1]
+        x_tensor = torch.tensor(x_seq, dtype=torch.float32)
+        
+        # Return target tensor if available
+        if self.y is not None:
+            # Use iloc to avoid deprecation warning when y is a pandas Series
+            if hasattr(self.y, 'iloc'):
+                y_val = self.y.iloc[idx]
+            else:
+                y_val = self.y[idx]
+                
+            # Convert to float32 tensor
+            y_tensor = torch.tensor(y_val, dtype=torch.float32)
+            return x_tensor, y_tensor
+        return x_tensor
+
+class LSTMModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, num_layers=2, output_dim=1, dropout=0.2, bidirectional=True, task='classification'):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers, batch_first=True, dropout=dropout, bidirectional=bidirectional)
+        self.fc = nn.Linear(hidden_dim*(2 if bidirectional else 1), output_dim)
+        self.task = task
+        # For binary classification, we'll use sigmoid activation
+        # For multi-class classification, use softmax
+        # For regression, don't use any activation
+        if task == 'classification' and output_dim == 1:
+            self.final_activation = nn.Sigmoid()
+        elif task == 'classification' and output_dim > 1:
+            self.final_activation = nn.Softmax(dim=1)
+        else:
+            self.final_activation = None
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = out[:, -1, :]
+        out = self.fc(out)
+        if self.final_activation:
+            out = self.final_activation(out)
+        return out
+
+class TransformerModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, num_layers=2, output_dim=1, nhead=4, dropout=0.1, task='classification'):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=nhead, dropout=dropout, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+        self.task = task
+        # For binary classification, we'll use sigmoid activation
+        # For multi-class classification, use softmax
+        # For regression, don't use any activation
+        if task == 'classification' and output_dim == 1:
+            self.final_activation = nn.Sigmoid()
+        elif task == 'classification' and output_dim > 1:
+            self.final_activation = nn.Softmax(dim=1)
+        else:
+            self.final_activation = None
+    def forward(self, x):
+        x = self.input_proj(x)
+        out = self.transformer(x)
+        out = out[:, -1, :]
+        out = self.fc(out)
+        if self.final_activation:
+            out = self.final_activation(out)
+        return out
+
+class PyTorchModelWrapper:
+    def __init__(self, model, task='classification', lr=0.001, batch_size=32, epochs=50, patience=5, seq_len=10, device=None):
+        self.model = model
+        self.task = task
+        self.lr = lr
+        self.batch_size = batch_size        self.epochs = epochs
+        self.patience = patience
+        self.seq_len = seq_len
+        self.device = device if device else DEVICE
+        self.model.to(self.device)
+        
+        if task == 'classification':
+            if model.fc.out_features == 1:
+                # BCEWithLogitsLoss handles numerical stability better and includes sigmoid
+                if getattr(model, 'final_activation', None) and isinstance(model.final_activation, nn.Sigmoid):
+                    self.criterion = nn.BCELoss()
+                else:
+                    self.criterion = nn.BCEWithLogitsLoss()
+            else:
+                self.criterion = nn.CrossEntropyLoss()
+        else:
+            self.criterion = nn.MSELoss()def fit(self, X, y, validation_data=None):
+        dataset = TimeSeriesDataset(X, y, seq_len=self.seq_len)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        best_loss = float('inf')
+        patience_counter = 0
+        for epoch in range(self.epochs):
+            self.model.train()
+            epoch_loss = 0
+            for xb, yb in loader:
+                xb, yb = xb.to(self.device), yb.to(self.device)
+                optimizer.zero_grad()
+                out = self.model(xb)
+                if self.task == 'classification' and self.model.fc.out_features == 1:
+                    # Ensure binary targets are properly shaped and in range [0,1]
+                    yb = yb.float().view(-1, 1).clamp(0, 1)
+                    # Ensure model outputs are properly clamped for BCE loss
+                    out = torch.clamp(out, 1e-7, 1-1e-7)
+                loss = self.criterion(out, yb)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+            avg_loss = epoch_loss / len(loader)
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= self.patience:
+                    break
+        return self
+    def predict(self, X):
+        self.model.eval()
+        dataset = TimeSeriesDataset(X, seq_len=self.seq_len)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
+        preds = []
+        with torch.no_grad():
+            for xb in loader:
+                xb = xb.to(self.device)
+                out = self.model(xb)
+                preds.append(out.cpu().numpy())
+        preds = np.vstack(preds)
+        if self.task == 'classification' and self.model.fc.out_features == 1:
+            return (preds > 0.5).astype(int).flatten()
+        elif self.task == 'classification' and self.model.fc.out_features > 1:
+            return np.argmax(preds, axis=1)
+        else:
+            return preds.flatten()    def predict_proba(self, X):
+        self.model.eval()
+        dataset = TimeSeriesDataset(X, seq_len=self.seq_len)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
+        probs = []
+        with torch.no_grad():
+            for xb in loader:
+                xb = xb.to(self.device)
+                out = self.model(xb)
+                # Ensure outputs are properly clamped for stability
+                if self.task == 'classification' and self.model.fc.out_features == 1:
+                    out = torch.clamp(out, 1e-7, 1-1e-7)
+                probs.append(out.cpu().numpy())
+        probs = np.vstack(probs)
+        if self.model.fc.out_features == 1:
+            # Ensure probabilities are in valid range [0,1]
+            probs = np.clip(probs, 0, 1)
+            return np.vstack((1-probs.flatten(), probs.flatten())).T
+        else:
+            return probs
+
+class KilnAccretionPredictor:
+    """
+    Predicts kiln accretion formation using LSTM/Transformer models (PyTorch) or fallback ML.
+    """
+    def __init__(self, model_type='lstm', seq_len=10, use_traditional_ml=False):
+        self.model_type = model_type
+        self.seq_len = seq_len
+        self.use_traditional_ml = use_traditional_ml
+        self.models = {}
+        self.scalers = {}
+        self.feature_names = None
+        self.zone_classes = None
+    def _create_model(self, task, input_dim, output_dim=1):
+        if self.model_type == 'lstm':
+            return PyTorchModelWrapper(LSTMModel(input_dim, output_dim=output_dim, task=task), task=task, seq_len=self.seq_len)
+        elif self.model_type == 'transformer':
+            return PyTorchModelWrapper(TransformerModel(input_dim, output_dim=output_dim, task=task), task=task, seq_len=self.seq_len)
+        else:
+            raise ValueError('Only LSTM and Transformer supported in this version.')    def fit(self, X, y_binary, y_days=None, y_zone=None):
+        self.feature_names = X.columns.tolist()
+        self.scalers['features'] = StandardScaler()
+        X_scaled = self.scalers['features'].fit_transform(X)
+        
+        # Train binary classification model
+        if y_binary is not None:
+            print(f"Training binary classifier with {len(y_binary)} samples")
+            # Ensure data is in proper format
+            valid_mask = ~y_binary.isna()
+            if valid_mask.sum() > 0:
+                X_bin = X_scaled[valid_mask]
+                y_bin = y_binary[valid_mask].astype(float)  # Convert to float for PyTorch
+                print(f"Binary target values min: {y_bin.min()}, max: {y_bin.max()}")
+                
+                self.models['binary_classifier'] = self._create_model('classification', X_scaled.shape[1], 1)
+                self.models['binary_classifier'].fit(X_bin, y_bin)
+        
+        # Train regression model for days prediction
+        if y_days is not None:
+            print(f"Training days regressor with {len(y_days)} samples")
+            valid_mask = ~y_days.isna()
+            if valid_mask.sum() > 0:
+                X_days = X_scaled[valid_mask]
+                y_days_valid = y_days[valid_mask]
+                
+                self.scalers['days'] = StandardScaler()
+                y_days_scaled = self.scalers['days'].fit_transform(y_days_valid.values.reshape(-1, 1)).ravel()
+                
+                self.models['days_regressor'] = self._create_model('regression', X_scaled.shape[1], 1)
+                self.models['days_regressor'].fit(X_days, y_days_scaled)
+        
+        # Train zone classifier model
+        if y_zone is not None:
+            print(f"Training zone classifier with {len(y_zone)} samples")
+            valid_mask = (y_zone != -1) & ~y_zone.isna()
+            if valid_mask.sum() > 0:
+                X_zone = X_scaled[valid_mask]
+                y_zone_valid = y_zone[valid_mask]
+                
+                self.zone_classes = sorted(np.unique(y_zone_valid))
+                print(f"Zone classes: {self.zone_classes}")
+                y_zone_mapped = np.array([self.zone_classes.index(z) for z in y_zone_valid])
+                
+                self.models['zone_classifier'] = self._create_model('classification', X_scaled.shape[1], len(self.zone_classes))
+                self.models['zone_classifier'].fit(X_zone, y_zone_mapped)
+    def predict(self, X):
+        X_scaled = self.scalers['features'].transform(X)
+        results = {}
+        if 'binary_classifier' in self.models:
+            results['binary_proba'] = self.models['binary_classifier'].predict_proba(X_scaled)[:, 1]
+            results['binary'] = (results['binary_proba'] > 0.5).astype(int)
+        if 'days_regressor' in self.models:
+            days_scaled = self.models['days_regressor'].predict(X_scaled)
+            results['days'] = self.scalers['days'].inverse_transform(days_scaled.reshape(-1, 1)).ravel()
+        if 'zone_classifier' in self.models and self.zone_classes is not None:
+            if 'binary' in results:
+                forming_mask = results['binary'] == 1
+                zone_preds = np.full(len(X), -1)
+                if forming_mask.sum() > 0:
+                    raw_preds = self.models['zone_classifier'].predict(X_scaled[forming_mask])
+                    zone_preds[forming_mask] = [self.zone_classes[p] for p in raw_preds]
+                results['zone'] = zone_preds
+            else:
+                results['zone'] = [self.zone_classes[p] for p in self.models['zone_classifier'].predict(X_scaled)]
+        return results
+    def evaluate(self, X, y_binary, y_days=None, y_zone=None):
+        preds = self.predict(X)
+        results = {}
+        if 'binary' in preds and y_binary is not None:
+            results['binary'] = {
+                'accuracy': accuracy_score(y_binary, preds['binary']),
+                'precision': precision_score(y_binary, preds['binary'], zero_division=0),
+                'recall': recall_score(y_binary, preds['binary'], zero_division=0),
+                'f1': f1_score(y_binary, preds['binary'], zero_division=0),
+                'roc_auc': roc_auc_score(y_binary, preds['binary_proba'])
+            }
+        if 'days' in preds and y_days is not None:
+            results['regression'] = {
+                'mse': mean_squared_error(y_days, preds['days']),
+                'rmse': np.sqrt(mean_squared_error(y_days, preds['days'])),
+                'r2': r2_score(y_days, preds['days'])
+            }
+        if 'zone' in preds and y_zone is not None:
+            valid = (y_zone != -1)
+            if valid.sum() > 0:
+                acc = accuracy_score(y_zone[valid], preds['zone'][valid])
+                results['zone'] = {'accuracy': acc}
+        return results
+    def save(self, path):
+        os.makedirs(path, exist_ok=True)
+        for name, model in self.models.items():
+            torch.save(model.model.state_dict(), os.path.join(path, f'{name}_state.pt'))
+        for name, scaler in self.scalers.items():
+            joblib.dump(scaler, os.path.join(path, f'{name}_scaler.pkl'))
+        if self.feature_names:
+            with open(os.path.join(path, 'feature_names.txt'), 'w') as f:
+                f.write('\n'.join(self.feature_names))
+        if self.zone_classes is not None:
+            joblib.dump(self.zone_classes, os.path.join(path, 'zone_classes.pkl'))
+    def load(self, path):
+        for name in ['binary_classifier', 'days_regressor', 'zone_classifier']:
+            state_path = os.path.join(path, f'{name}_state.pt')
+            if os.path.exists(state_path):
+                # You must re-instantiate the model with correct dims before loading
+                pass  # Not implemented for brevity
+        for name in ['features', 'days']:
+            scaler_path = os.path.join(path, f'{name}_scaler.pkl')
+            if os.path.exists(scaler_path):
+                self.scalers[name] = joblib.load(scaler_path)
+        feature_file = os.path.join(path, 'feature_names.txt')
+        if os.path.exists(feature_file):
+            with open(feature_file, 'r') as f:
+                self.feature_names = f.read().splitlines()
+        zone_file = os.path.join(path, 'zone_classes.pkl')
+        if os.path.exists(zone_file):
+            self.zone_classes = joblib.load(zone_file)
